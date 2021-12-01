@@ -1,0 +1,77 @@
+#!/bin/bash -x
+
+IMAGE=$1
+PASSWORD=$2
+
+OUTPUT=disk.img
+CONT=cwtemp
+OUTDIR=/tmp/cwcontext
+ROOT_DIR=/tmp/rootfs
+DISK=$OUTDIR/$OUTPUT
+DISK_SIZE=2G
+CRYPT_PARTITION=cwroot
+
+mkdir -p $OUTDIR $ROOT_DIR
+fallocate -l $DISK_SIZE $DISK
+
+echo "YES" | echo "$PASSWORD"| cryptsetup luksFormat -y -v --type luks1 $DISK
+if [ $? != 0 ]; then
+	echo "luksFormat failed"
+	exit 1
+fi
+
+echo "$PASSWORD" | cryptsetup luksOpen $DISK $CRYPT_PARTITION
+if [ $? != 0 ]; then
+	echo "luksOpen failed"
+	exit 1
+fi
+
+mkfs.ext4 /dev/mapper/$CRYPT_PARTITION
+if [ $? != 0 ]; then
+	echo "mkfs.ext4 failed"
+	exit 1
+fi
+
+mount /dev/mapper/$CRYPT_PARTITION $ROOT_DIR
+if [ $? != 0 ]; then
+	echo "mount failed"
+	exit 1
+fi
+
+buildah from --name $CONT $IMAGE
+if [ $? != 0 ]; then
+	echo "buildah from failed"
+	exit 1
+fi
+
+dir=$(buildah mount $CONT)
+if [ $? != 0 ]; then
+	echo "buildah mount failed"
+	exit 1
+fi
+
+cp -a $dir/* $ROOT_DIR
+if [ $? != 0 ]; then
+	echo "cp -a failed"
+	exit 1
+fi
+
+buildah umount $CONT
+buildah rm $CONT
+umount $ROOT_DIR
+cryptsetup luksClose $CRYPT_PARTITION
+
+mkdir $OUTDIR/tmp
+cp /usr/bin/libkrun-sev.chain $OUTDIR/tmp/libkrun-sev.chain
+touch $OUTDIR/entrypoint.sh
+chmod +x $OUTDIR/entrypoint.sh
+
+cat << EOF > $OUTDIR/Dockerfile
+FROM scratch
+
+COPY tmp /tmp
+COPY disk.img /disk.img
+COPY entrypoint.sh /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+EOF

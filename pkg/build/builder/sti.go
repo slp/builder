@@ -3,11 +3,14 @@ package builder
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -34,6 +37,8 @@ import (
 	"github.com/openshift/builder/pkg/build/builder/timing"
 	builderutil "github.com/openshift/builder/pkg/build/builder/util"
 	"github.com/openshift/builder/pkg/build/builder/util/dockerfile"
+
+	"github.com/google/uuid"
 )
 
 // builderFactory is the internal interface to decouple S2I-specific code from Origin builder code
@@ -356,6 +361,10 @@ func (s *S2IBuilder) Build() error {
 		ContextDir:          "/tmp/dockercontext",
 	}
 
+	log.V(0).Infof("pushTag: %s", pushTag)
+	log.V(0).Infof("buildTag: %s", buildTag)
+	log.V(0).Infof("defaultDcokerfilePath: %s", defaultDockerfilePath)
+
 	if s.cgLimits != nil {
 		opts.CPUPeriod = s.cgLimits.CPUPeriod
 		opts.CPUQuota = s.cgLimits.CPUQuota
@@ -398,6 +407,61 @@ func (s *S2IBuilder) Build() error {
 		s.build.Status.Message = builderutil.StatusMessageGenericBuildFailed
 		return err
 	}
+
+	var cw_env = ""
+	var cw_workdir = ""
+	var cw_password = ""
+
+	if strings.Contains(buildTag, "-cw") {
+		cmd := exec.Command("python3", "/usr/bin/extract_env.py", buildTag)
+		stdout, err := cmd.Output()
+		if err != nil {
+			log.V(0).Infof("env extraction failed: %v", err)
+			return err
+		}
+		cw_env = string(stdout[:])
+		log.V(0).Infof("env: %s", cw_env)
+
+		cmd = exec.Command("buildah", "inspect", "--format='{{.OCIv1.Config.WorkingDir}}'", buildTag)
+		stdout, err = cmd.Output()
+		if err != nil {
+			log.V(0).Infof("workdir extraction failed: %v", err)
+			return err
+		}
+		cw_workdir = strings.ReplaceAll(string(stdout[:]), "'", "")
+		log.V(0).Infof("workdir: %s", cw_workdir)
+
+		cw_password = uuid.New().String()
+		cmd = exec.Command("/usr/bin/cw-build", buildTag, cw_password)
+		stdout, err = cmd.Output()
+		if err != nil {
+			log.V(0).Infof("cw image generation failed: %v", err)
+			return err
+		}
+		log.V(0).Infof("cwbuild out: %s", stdout)
+
+		opts = dockerclient.BuildImageOptions{
+			Context:             ctx,
+			Name:                buildTag,
+			RmTmpContainer:      true,
+			ForceRmTmpContainer: true,
+			OutputStream:        os.Stdout,
+			Dockerfile:          defaultDockerfilePath,
+			NoCache:             false,
+			Pull:                s.build.Spec.Strategy.SourceStrategy.ForcePull,
+			ContextDir:          "/tmp/cwcontext",
+		}
+
+		log.V(0).Infof("generating an image with the encrypted disk")
+		err = s.dockerClient.BuildImage(opts)
+		if err != nil {
+			log.V(0).Infof("image generation failed: %v", err)
+			log.V(0).Infof("taking a nap")
+			time.Sleep(300 * time.Second)
+			return err
+		}
+	}
+
 	if push {
 		if err = tagImage(s.dockerClient, buildTag, pushTag); err != nil {
 			return err
@@ -427,6 +491,23 @@ func (s *S2IBuilder) Build() error {
 		}
 
 		if len(digest) > 0 {
+			log.V(0).Infof("digest: %s", digest)
+			if cw_password != "" {
+				var kernelCmdLine = `KRUN_CFG=2:512 reboot=k panic=-1 panic_print=0 pci=off nomodules console=hvc0 rw no-kvmapf init=/bin/sh virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 virtio_mmio.device=4K@0xd0002000:7 virtio_mmio.device=4K@0xd0003000:8 swiotlb=65536 KRUN_PASS=` + cw_password + ` KRUN_INIT=/usr/libexec/s2i/run KRUN_WORKDIR=` + cw_workdir + ` ` + cw_env
+
+				var jsonStr = []byte(`{"sha":"` + digest + `","name":"` + strings.ReplaceAll(pushTag, ":latest", "") + `","kernel_cmd_line":"` + base64.StdEncoding.EncodeToString([]byte(kernelCmdLine)) + `"}`)
+				log.V(0).Infof("jsonStr: %s", jsonStr)
+				req, err := http.NewRequest("POST", "http://registration-attestation-server.attestation:8080/confidential/register-image", bytes.NewBuffer(jsonStr))
+				req.Header.Set("Content-Type", "application/json")
+
+				client := &http.Client{}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.V(0).Infof("error registering image: %v", err)
+				}
+				defer resp.Body.Close()
+			}
+
 			s.build.Status.Output.To = &buildapiv1.BuildStatusOutputTo{
 				ImageDigest: digest,
 			}
